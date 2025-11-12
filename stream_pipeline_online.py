@@ -11,7 +11,7 @@ from core.atomic_components.motion_stitch import MotionStitch
 from core.atomic_components.warp_f3d import WarpF3D
 from core.atomic_components.decode_f3d import DecodeF3D
 from core.atomic_components.putback import PutBack
-from core.atomic_components.writer import VideoWriterByImageIO
+from core.atomic_components.writer import VideoWriterByImageIO, RTMPStreamWriter
 from core.atomic_components.wav2feat import Wav2Feat
 from core.atomic_components.cfg import parse_cfg, print_cfg
 
@@ -218,8 +218,18 @@ class StreamSDK:
 
         # ======== Video Writer ========
         self.output_path = output_path
-        self.tmp_output_path = output_path + ".tmp.mp4"
-        self.writer = VideoWriterByImageIO(self.tmp_output_path)
+        # 根据 online_mode 决定使用文件写入器还是 RTMP 推流器
+        if self.online_mode:
+            # 在线模式：使用 RTMP 推流
+            rtmp_url = kwargs.get("rtmp_url", "rtmp://localhost:1935/live/stream")
+            self.tmp_output_path = None  # 在线模式下不写入文件
+            self.writer = RTMPStreamWriter(rtmp_url, fps=25)
+            print(f"在线模式：使用 RTMP 推流到 {rtmp_url}")
+        else:
+            # 离线模式：使用文件写入器
+            self.tmp_output_path = output_path + ".tmp.mp4"
+            self.writer = VideoWriterByImageIO(self.tmp_output_path)
+            print(f"离线模式：写入文件到 {self.tmp_output_path}")
         self.writer_pbar = tqdm(desc="writer")
 
         # ======== Audio Feat Buffer ========
@@ -286,6 +296,7 @@ class StreamSDK:
             if item is None:
                 break
             res_frame_rgb = item
+            # 推送帧到 RTMP 流（在线模式）或写入文件（离线模式）
             self.writer(res_frame_rgb, fmt="rgb")
             self.writer_pbar.update()
 
@@ -488,6 +499,7 @@ class StreamSDK:
             thread.join()
 
         try:
+            # 关闭写入器（RTMP 推流器或文件写入器）
             self.writer.close()
             self.writer_pbar.close()
         except:
