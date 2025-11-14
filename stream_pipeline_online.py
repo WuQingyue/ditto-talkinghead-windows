@@ -222,8 +222,14 @@ class StreamSDK:
         if self.online_mode:
             # 在线模式：使用 RTMP 推流
             rtmp_url = kwargs.get("rtmp_url", "rtmp://localhost:1935/live/stream")
+            audio_path = kwargs.get("audio_path", None)  # 获取音频路径参数
+            audio_sr = kwargs.get("audio_sr", 16000)  # 获取音频采样率参数
+            use_silent_audio = kwargs.get("use_silent_audio", False)  # 是否使用静音音频流
             self.tmp_output_path = None  # 在线模式下不写入文件
-            self.writer = RTMPStreamWriter(rtmp_url, fps=25)
+            self.writer = RTMPStreamWriter(rtmp_url, fps=25, 
+                                          audio_path=audio_path, 
+                                          audio_sr=audio_sr,
+                                          use_silent_audio=use_silent_audio)
             print(f"在线模式：使用 RTMP 推流到 {rtmp_url}")
         else:
             # 离线模式：使用文件写入器
