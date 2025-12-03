@@ -140,7 +140,7 @@ async def offer(request):
     audio_sender = pc.addTrack(player.audio)
     video_sender = pc.addTrack(player.video)
     # Workaround: some aiortc versions access private __encoder before it exists.
-    # Pre-initialize to avoid AttributeError in RTCRtpSender._handle_rtcp_packet.
+    # Pre-initialize to avoid AttributeError in older aiortc
     try:
         if not hasattr(audio_sender, "_RTCRtpSender__encoder"):
             setattr(audio_sender, "_RTCRtpSender__encoder", None)
@@ -149,16 +149,60 @@ async def offer(request):
     except Exception:
         pass
 
-    capabilities = RTCRtpSender.getCapabilities("video")
-    preferences = list(filter(lambda x: x.name == "H264", capabilities.codecs))
-    preferences += list(filter(lambda x: x.name == "VP8", capabilities.codecs))
-    preferences += list(filter(lambda x: x.name == "rtx", capabilities.codecs))
-    transceiver = pc.getTransceivers()[1]
-    transceiver.setCodecPreferences(preferences)
-
     await pc.setRemoteDescription(offer)
 
+    # Create answer then munge SDP to enforce higher target bitrate for video
     answer = await pc.createAnswer()
+
+    def _munge_video_bitrate(sdp: str, max_kbps: int = 3000, min_kbps: int = 1800) -> str:
+        lines = sdp.split("\r\n")
+        out = []
+        in_video = False
+        video_payloads = set()
+        # First pass: collect payload types for video codecs (H264/VP8), and insert b=AS
+        for i, ln in enumerate(lines):
+            if ln.startswith("m="):
+                in_video = ln.startswith("m=video")
+            if in_video and ln.startswith("m=video"):
+                # ensure a bandwidth line b=AS:max_kbps after media header if not present later
+                out.append(ln)
+                # We will add a b=AS line immediately after if not already added in previous media lines
+                # But defer decision until we see next non-empty line; add here for simplicity
+                out.append(f"b=AS:{max_kbps}")
+                continue
+            # Collect rtpmap payloads mapping to H264/VP8
+            if in_video and ln.startswith("a=rtpmap:"):
+                try:
+                    pt, rest = ln[len("a=rtpmap:"):].split(" ", 1)
+                    codec = rest.split("/")[0].upper()
+                    if codec in ("H264", "VP8"):
+                        video_payloads.add(pt)
+                except Exception:
+                    pass
+            out.append(ln)
+
+        # Second pass: add/patch fmtp for those payloads with x-google-*
+        sdp2 = []
+        for ln in out:
+            if ln.startswith("a=fmtp:"):
+                try:
+                    head, params = ln.split(" ", 1)
+                    pt = head[len("a=fmtp:"):]
+                    if pt in video_payloads:
+                        kv = params
+                        # append or update x-google-max-bitrate/min-bitrate (in kbps)
+                        # Normalize separators
+                        if kv and not kv.endswith(";"):
+                            kv = kv + ";"
+                        kv = kv + f"x-google-max-bitrate={max_kbps};x-google-min-bitrate={min_kbps}"
+                        ln = f"a=fmtp:{pt} {kv}"
+                except Exception:
+                    pass
+            sdp2.append(ln)
+        return "\r\n".join(sdp2)
+
+    munged = _munge_video_bitrate(answer.sdp, max_kbps=3000, min_kbps=1800)
+    answer = RTCSessionDescription(sdp=munged, type=answer.type)
     await pc.setLocalDescription(answer)
 
     #return jsonify({"sdp": pc.localDescription.sdp, "type": pc.localDescription.type})

@@ -1,4 +1,5 @@
 var pc = null;
+var remoteStream = null;
 
 function negotiate() {
     pc.addTransceiver('video', { direction: 'recvonly' });
@@ -55,12 +56,20 @@ function start() {
 
     pc = new RTCPeerConnection(config);
 
-    // connect audio / video
+    // Use a single MediaStream for both audio and video to keep A/V in sync
+    remoteStream = new MediaStream();
+    const videoEl = document.getElementById('video');
+    // Ensure autoplay policies are met in most browsers
+    if (videoEl) {
+        videoEl.autoplay = true;
+        videoEl.playsInline = true;
+    }
+
     pc.addEventListener('track', (evt) => {
-        if (evt.track.kind == 'video') {
-            document.getElementById('video').srcObject = evt.streams[0];
-        } else {
-            document.getElementById('audio').srcObject = evt.streams[0];
+        // Some browsers may not populate evt.streams; always add the track explicitly
+        remoteStream.addTrack(evt.track);
+        if (videoEl && videoEl.srcObject !== remoteStream) {
+            videoEl.srcObject = remoteStream;
         }
     });
 
