@@ -11,7 +11,7 @@ from core.atomic_components.motion_stitch import MotionStitch
 from core.atomic_components.warp_f3d import WarpF3D
 from core.atomic_components.decode_f3d import DecodeF3D
 from core.atomic_components.putback import PutBack
-from core.atomic_components.writer import VideoWriterByImageIO, RTMPStreamWriter
+from core.atomic_components.writer import VideoWriterByImageIO
 from core.atomic_components.wav2feat import Wav2Feat
 from core.atomic_components.cfg import parse_cfg, print_cfg
 
@@ -93,7 +93,7 @@ class StreamSDK:
                 ctrl_info[i] = item
         self.ctrl_info = ctrl_info
 
-    def setup(self, source_path, output_path, **kwargs):
+    def setup(self, source_path, output_path, writer=None, **kwargs):
 
         # ======== Prepare Options ========
         kwargs = self._merge_kwargs(self.default_kwargs, kwargs)
@@ -124,7 +124,7 @@ class StreamSDK:
         self.fix_kp_cond = kwargs.get("fix_kp_cond", 0)
         self.fix_kp_cond_dim = kwargs.get("fix_kp_cond_dim", None)  # [ds,de]
         self.sampling_timesteps = kwargs.get("sampling_timesteps", 50)
-        self.online_mode = kwargs.get("online_mode", False)
+        self.online_mode = False
         self.v_min_max_for_clip = kwargs.get('v_min_max_for_clip', None)
         self.smo_k_d = kwargs.get("smo_k_d", 3)
 
@@ -156,8 +156,7 @@ class StreamSDK:
                 delta_roll
         """
 
-        # only hubert support online mode
-        assert self.wav2feat.support_streaming or not self.online_mode
+        # online mode removed; always run offline
 
         # ======== Register Avatar ========
         crop_kwargs = {
@@ -218,33 +217,20 @@ class StreamSDK:
 
         # ======== Video Writer ========
         self.output_path = output_path
-        # 根据 online_mode 决定使用文件写入器还是 RTMP 推流器
-        if self.online_mode:
-            # 在线模式：使用 RTMP 推流
-            rtmp_url = kwargs.get("rtmp_url", "rtmp://localhost:1935/live/stream")
-            audio_path = kwargs.get("audio_path", None)  # 获取音频路径参数
-            audio_sr = kwargs.get("audio_sr", 16000)  # 获取音频采样率参数
-            use_silent_audio = kwargs.get("use_silent_audio", False)  # 是否使用静音音频流
-            self.tmp_output_path = None  # 在线模式下不写入文件
-            self.writer = RTMPStreamWriter(rtmp_url, fps=25, 
-                                          audio_path=audio_path, 
-                                          audio_sr=audio_sr,
-                                          use_silent_audio=use_silent_audio)
-            print(f"在线模式：使用 RTMP 推流到 {rtmp_url}")
+        # Allow external writer injection (e.g., WebRTC). If not provided, default to file writer.
+        if writer is not None:
+            self.tmp_output_path = None
+            self.writer = writer
+            print("在线模式：使用自定义 Writer (例如 WebRTC)")
         else:
-            # 离线模式：使用文件写入器
+            # Always write to file
             self.tmp_output_path = output_path + ".tmp.mp4"
             self.writer = VideoWriterByImageIO(self.tmp_output_path)
             print(f"离线模式：写入文件到 {self.tmp_output_path}")
         self.writer_pbar = tqdm(desc="writer")
 
         # ======== Audio Feat Buffer ========
-        if self.online_mode:
-            # buffer: seq_frames - valid_clip_len
-            self.audio_feat = self.wav2feat.wav2feat(np.zeros((self.overlap_v2 * 640,), dtype=np.float32), sr=16000)
-            assert len(self.audio_feat) == self.overlap_v2, f"{len(self.audio_feat)}"
-        else:
-            self.audio_feat = np.zeros((0, self.wav2feat.feat_dim), dtype=np.float32)
+        self.audio_feat = np.zeros((0, self.wav2feat.feat_dim), dtype=np.float32)
         self.cond_idx_start = 0 - len(self.audio_feat)
 
         # ======== Setup Worker Threads ========
@@ -300,6 +286,11 @@ class StreamSDK:
                 continue
 
             if item is None:
+                # writer queue completed: close writer now to emit EOS (no tail padding)
+                try:
+                    self.writer.close()
+                except Exception:
+                    pass
                 break
             res_frame_rgb = item
             # 推送帧到 RTMP 流（在线模式）或写入文件（离线模式）
