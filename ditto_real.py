@@ -84,29 +84,45 @@ class AudioPusher(threading.Thread):
         self.chunk = chunk_samples
         self._quit = threading.Event()
         self._data = data  # if provided, use this preloaded mono float32 16kHz audio
+        # buffering for multiple uploads
+        self._lock = threading.Lock()
+        self._cond = threading.Condition(self._lock)
+        self._buffer_list: list[np.ndarray] = []  # list of float32 mono 16k arrays
 
     def stop(self):
         self._quit.set()
 
     def run(self):
-        # Prepare audio as float32 mono at 16k
-        if self._data is not None:
-            data = self._data
-        else:
-            data, sr = sf.read(self.wav_path, dtype='float32')
-            if data.ndim > 1:
-                data = data[:, 0]
-            if sr != self.sample_rate:
-                # resample using librosa for simplicity
-                data = librosa.resample(data, orig_sr=sr, target_sr=self.sample_rate)
-        idx = 0
-        # pace by real time: 20ms per chunk
-        ptime = self.chunk / float(self.sample_rate)
+        # If initial data provided, queue it
+        if self._data is not None and isinstance(self._data, np.ndarray) and self._data.size > 0:
+            with self._cond:
+                self._buffer_list.append(self._data.astype(np.float32))
+                self._data = None
+                self._cond.notify_all()
+
+        ptime = self.chunk / float(self.sample_rate)  # 20ms pacing
         start = time.time()
         sent_chunks = 0
-        while not self._quit.is_set() and idx + self.chunk <= len(data):
-            chunk = data[idx:idx + self.chunk]
-            # convert to s16 for aiortc AudioFrame
+        cur: np.ndarray | None = None
+        idx = 0
+        while not self._quit.is_set():
+            if cur is None or idx >= len(cur):
+                # fetch next buffer or wait
+                with self._cond:
+                    while not self._quit.is_set() and len(self._buffer_list) == 0:
+                        self._cond.wait(timeout=0.1)
+                    if self._quit.is_set():
+                        break
+                    cur = self._buffer_list.pop(0)
+                    idx = 0
+                    start = time.time()
+                    sent_chunks = 0
+            # send one chunk (with tail padding inside the buffer)
+            end = min(idx + self.chunk, len(cur))
+            chunk = cur[idx:end]
+            if len(chunk) < self.chunk:
+                pad = np.zeros((self.chunk - len(chunk),), dtype=np.float32)
+                chunk = np.concatenate([chunk, pad], 0)
             s16 = (chunk * 32767.0).astype(np.int16)
             af = AudioFrame(format='s16', layout='mono', samples=self.chunk)
             af.planes[0].update(s16.tobytes())
@@ -114,32 +130,27 @@ class AudioPusher(threading.Thread):
             asyncio.run_coroutine_threadsafe(self.audio_track._queue.put((af, None)), self.loop)
             idx += self.chunk
             sent_chunks += 1
-            # sleep to maintain 20ms pacing
             target_time = start + sent_chunks * ptime
             delay = target_time - time.time()
             if delay > 0:
                 time.sleep(delay)
-        # send tail with zero padding if any samples remain (< one chunk)
-        if not self._quit.is_set() and idx < len(data):
-            tail = data[idx:]
-            pad_len = self.chunk - len(tail)
-            if pad_len > 0:
-                tail = np.concatenate([tail, np.zeros(pad_len, dtype=tail.dtype)], axis=0)
-            s16 = (tail * 32767.0).astype(np.int16)
-            af = AudioFrame(format='s16', layout='mono', samples=self.chunk)
-            af.planes[0].update(s16.tobytes())
-            af.sample_rate = self.sample_rate
-            asyncio.run_coroutine_threadsafe(self.audio_track._queue.put((af, None)), self.loop)
-            sent_chunks += 1
-            target_time = start + sent_chunks * ptime
-            delay = target_time - time.time()
-            if delay > 0:
-                time.sleep(delay)
-        # end of audio pusher: signal EOS to audio track (no padding)
+        # On quit, signal EOS once
         try:
             asyncio.run_coroutine_threadsafe(self.audio_track._queue.put((None, 'eof_audio')), self.loop)
         except Exception:
             pass
+
+    def append_audio(self, data: np.ndarray, sr: int):
+        # append new audio segment (any time). Converts to mono float32 16k
+        x = np.asarray(data)
+        if x.ndim > 1:
+            x = x[:, 0]
+        if sr != self.sample_rate and x.size > 0:
+            x = librosa.resample(x.astype(np.float32), orig_sr=sr, target_sr=self.sample_rate)
+        x = x.astype(np.float32)
+        with self._cond:
+            self._buffer_list.append(x)
+            self._cond.notify_all()
 
 
 class DittoReal(BaseReal):
@@ -165,6 +176,23 @@ class DittoReal(BaseReal):
     # allow runtime setting of audio path per session
     def set_audio_path(self, path: str):
         self._audio_path = path
+        # If SDK is already running, push this newly uploaded audio into scheduler immediately
+        try:
+            sdk = getattr(self, '_sdk', None)
+            if sdk is not None and hasattr(sdk, 'push_audio_file_bytes'):
+                with open(path, 'rb') as f:
+                    file_bytes = f.read()
+                sdk.push_audio_file_bytes(file_bytes)
+            # Also append to webrtc audio pusher for audible playback
+            if self._audio_pusher is not None:
+                try:
+                    data, sr = sf.read(path, dtype='float32')
+                    self._audio_pusher.append_audio(data, sr)
+                except Exception:
+                    pass
+        except Exception:
+            # non-fatal; initial render loop will still consume _audio_path if needed
+            pass
 
     def render(self, quit_event, loop=None, audio_track=None, video_track=None):
         # 1) Build StreamSDK from opt
@@ -215,15 +243,19 @@ class DittoReal(BaseReal):
         sdk.setup(source_path, "unused_output_path_from_webrtc", writer=webrtc_writer)
         sdk.setup_Nd(N_d=n_frames, fade_in=-1, fade_out=-1, ctrl_info={})
 
-        # 4) Start audio pusher to webrtc, reusing the same audio ndarray for consistency
+        # 4) Start audio pusher to webrtc, queue initial audio; later uploads will be appended
         self._audio_pusher = AudioPusher(loop, audio_track, audio_path, data=audio)
         self._audio_pusher.start()
 
-        # 5) Feed audio features (offline chunk once, same as inference.py)
-        aud_feat = sdk.wav2feat.wav2feat(audio)
-        sdk.audio2motion_queue.put(aud_feat)
-        # Immediately signal end-of-audio to let the pipeline flush and close writer (emit eof_video)
-        sdk.audio2motion_queue.put(None)
+        # 5) Feed audio to StreamSDK scheduler as bytes; do NOT signal EOF.
+        # This allows continuous video with silence after audio ends, and supports multiple uploads.
+        try:
+            with open(audio_path, 'rb') as f:
+                file_bytes = f.read()
+            sdk.push_audio_file_bytes(file_bytes)
+        except Exception:
+            # Fallback: push from in-memory ndarray if file reading fails
+            sdk.push_audio_chunk(audio, sr=16000)
 
         # 6) Wait until quit_event is set, then close everything
         try:

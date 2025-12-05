@@ -3,6 +3,8 @@ import queue
 import numpy as np
 import traceback
 from tqdm import tqdm
+import time
+import librosa
 
 from core.atomic_components.avatar_registrar import AvatarRegistrar, smooth_x_s_info_lst
 from core.atomic_components.condition_handler import ConditionHandler, _mirror_index
@@ -233,6 +235,17 @@ class StreamSDK:
         self.audio_feat = np.zeros((0, self.wav2feat.feat_dim), dtype=np.float32)
         self.cond_idx_start = 0 - len(self.audio_feat)
 
+        # ======== Audio Block Scheduler ========
+        self.sample_rate = 16000
+        self.chunksize = kwargs.get("chunksize", (3, 5, 2))
+        self._split_len = int(sum(self.chunksize) * 0.04 * self.sample_rate) + 80
+        self._step_len = int(self.chunksize[1] * 0.04 * self.sample_rate)
+        self._overlap_len = self._split_len - self._step_len
+        self._sched_lock = threading.Lock()
+        self._incoming_buffer = np.zeros((0,), dtype=np.float32)
+        self._prev_tail = np.zeros((self._overlap_len,), dtype=np.float32)
+        self._next_emit_time = None
+
         # ======== Setup Worker Threads ========
         QUEUE_MAX_SIZE = 100
         # self.QUEUE_TIMEOUT = None
@@ -248,6 +261,7 @@ class StreamSDK:
         self.writer_queue = queue.Queue(maxsize=QUEUE_MAX_SIZE)
 
         self.thread_list = [
+            threading.Thread(target=self.audio_block_scheduler_worker),
             threading.Thread(target=self.audio2motion_worker),
             threading.Thread(target=self.motion_stitch_worker),
             threading.Thread(target=self.warp_f3d_worker),
@@ -388,6 +402,13 @@ class StreamSDK:
         except Exception as e:
             self.worker_exception = e
             self.stop_event.set()
+
+    def audio_block_scheduler_worker(self):
+        try:
+            self._audio_block_scheduler_worker()
+        except Exception as e:
+            self.worker_exception = e
+            self.stop_event.set()
         
     def _audio2motion_worker(self):
         is_end = False
@@ -489,7 +510,8 @@ class StreamSDK:
         self.motion_stitch_queue.put(None)
 
     def close(self):
-        # flush frames
+        # flush frames and signal stop
+        self.stop_event.set()
         self.audio2motion_queue.put(None)
         # Wait for worker threads to finish
         for thread in self.thread_list:
@@ -515,6 +537,59 @@ class StreamSDK:
                 break
             except queue.Full:
                 continue
+
+    def push_audio_chunk(self, audio, sr=16000):
+        if isinstance(audio, bytes):
+            return self.push_audio_file_bytes(audio)
+        x = np.asarray(audio)
+        if x.ndim > 1:
+            x = x[:, 0]
+        if sr != self.sample_rate and x.shape[0] > 0:
+            x = librosa.resample(x, orig_sr=sr, target_sr=self.sample_rate)
+        x = x.astype(np.float32)
+        with self._sched_lock:
+            self._incoming_buffer = np.concatenate([self._incoming_buffer, x], 0)
+
+    def push_audio_file_bytes(self, filebyte):
+        import soundfile as sf
+        import io
+        by = io.BytesIO(filebyte)
+        stream, sample_rate = sf.read(by)
+        stream = np.asarray(stream)
+        if stream.ndim > 1:
+            stream = stream[:, 0]
+        if sample_rate != self.sample_rate and stream.shape[0] > 0:
+            stream = librosa.resample(stream, orig_sr=sample_rate, target_sr=self.sample_rate)
+        stream = stream.astype(np.float32)
+        with self._sched_lock:
+            self._incoming_buffer = np.concatenate([self._incoming_buffer, stream], 0)
+
+    def _audio_block_scheduler_worker(self):
+        emit_dt = self._step_len / float(self.sample_rate)
+        while not self.stop_event.is_set():
+            now = time.time()
+            if self._next_emit_time is None:
+                self._next_emit_time = now
+            sleep_t = self._next_emit_time - now
+            if sleep_t > 0:
+                time.sleep(min(sleep_t, 0.01))
+                continue
+            need_new = self._step_len
+            with self._sched_lock:
+                avail = int(self._incoming_buffer.shape[0])
+                take = min(avail, need_new)
+                new_samples = self._incoming_buffer[:take]
+                self._incoming_buffer = self._incoming_buffer[take:]
+            if take < need_new:
+                pad = np.zeros((need_new - take,), dtype=np.float32)
+                new_samples = np.concatenate([new_samples, pad], 0) if take > 0 else pad
+            block = np.concatenate([self._prev_tail, new_samples], 0)
+            if block.shape[0] < self._split_len:
+                pad2 = np.zeros((self._split_len - block.shape[0],), dtype=np.float32)
+                block = np.concatenate([block, pad2], 0)
+            self._prev_tail = block[-self._overlap_len:]
+            self.run_chunk(block.astype(np.float32), chunksize=self.chunksize)
+            self._next_emit_time += emit_dt
 
 
 

@@ -38,8 +38,22 @@ function negotiate() {
     }).then((answer) => {
         document.getElementById('sessionid').value = answer.sessionid
         return pc.setRemoteDescription(answer);
-    }).catch((e) => {
-        alert(e);
+    }).then(() => {
+        // wait for ICE connection to be established (connected or completed)
+        return new Promise((resolve) => {
+            const done = () => (pc.iceConnectionState === 'connected' || pc.iceConnectionState === 'completed');
+            if (done()) {
+                resolve();
+                return;
+            }
+            const onState = () => {
+                if (done()) {
+                    pc.removeEventListener('iceconnectionstatechange', onState);
+                    resolve();
+                }
+            };
+            pc.addEventListener('iceconnectionstatechange', onState);
+        });
     });
 }
 
@@ -73,9 +87,48 @@ function start() {
         }
     });
 
-    document.getElementById('start').style.display = 'none';
-    negotiate();
-    document.getElementById('stop').style.display = 'inline-block';
+    const startBtn = document.getElementById('start');
+    const stopBtn = document.getElementById('stop');
+    // upload controls
+    const uploadAudioBtn = document.getElementById('btn_upload_audio');
+    const uploadSourceBtn = document.getElementById('btn_upload_source');
+    // Set Start to loading/disabled while negotiating and connecting
+    if (startBtn) {
+        startBtn.disabled = true;
+        startBtn.textContent = 'Starting...';
+    }
+    if (stopBtn) {
+        stopBtn.style.display = 'none';
+    }
+    // Disable upload buttons until WebRTC connected
+    if (uploadAudioBtn) uploadAudioBtn.disabled = true;
+    if (uploadSourceBtn) uploadSourceBtn.disabled = true;
+
+    negotiate().then(() => {
+        // Connected: hide Start, show Stop
+        if (startBtn) {
+            startBtn.disabled = false;
+            startBtn.textContent = 'Start';
+            startBtn.style.display = 'none';
+        }
+        if (stopBtn) {
+            stopBtn.style.display = 'inline-block';
+        }
+        // Re-enable upload buttons only after connection succeeds
+        if (uploadAudioBtn) uploadAudioBtn.disabled = false;
+        if (uploadSourceBtn) uploadSourceBtn.disabled = false;
+    }).catch((e) => {
+        // Failure: restore Start button state, keep Stop hidden
+        if (startBtn) {
+            startBtn.disabled = false;
+            startBtn.textContent = 'Start';
+        }
+        if (stopBtn) {
+            stopBtn.style.display = 'none';
+        }
+        // Keep upload buttons disabled until a successful connection per requirement
+        alert(e);
+    });
 }
 
 function stop() {

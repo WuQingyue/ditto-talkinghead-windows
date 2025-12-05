@@ -7,6 +7,7 @@ import torch
 import ctypes
 import os
 import torch
+import threading
 
 try:
     import tensorrt as trt
@@ -94,6 +95,9 @@ class TRTWrapper:
         trt_file: str,
         plugin_file_list: list = ["./checkpoints/plugins/grid_sample_3d_plugin.dll"],
     ) -> None:
+        # Thread-safety primitives
+        self._lock = threading.RLock()
+        self._in_txn = False
         # Load custom plugins
         for plugin_file in plugin_file_list:
             if os.path.isfile(plugin_file):
@@ -121,72 +125,84 @@ class TRTWrapper:
         print(f"Successfully loaded TensorRT engine: {trt_file}")
 
     def setup(self, input_data: dict = {}) -> None:
-        for name, value in self.buffer.items():
-            _, device_buffer, _ = value
-            if (
-                device_buffer is not None
-                and device_buffer != 0
-                and name not in self.output_allocator_map
-            ):
-                checkCudaErrors(cudart.cudaFree(device_buffer))
-                self.buffer[name][1] = None
-                self.buffer[name][2] = 0
-        self.tensor_name_list = [
-            self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)
-        ]
-        self.n_input = sum(
-            [
-                self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
-                for name in self.tensor_name_list
+        # Begin atomic section for setup+infer. We keep the lock held until infer finishes.
+        self._lock.acquire()
+        self._in_txn = True
+        try:
+            for name, value in self.buffer.items():
+                _, device_buffer, _ = value
+                if (
+                    device_buffer is not None
+                    and device_buffer != 0
+                    and name not in self.output_allocator_map
+                ):
+                    checkCudaErrors(cudart.cudaFree(device_buffer))
+                    self.buffer[name][1] = None
+                    self.buffer[name][2] = 0
+            self.tensor_name_list = [
+                self.engine.get_tensor_name(i) for i in range(self.engine.num_io_tensors)
             ]
-        )
-        self.n_output = self.engine.num_io_tensors - self.n_input
+            self.n_input = sum(
+                [
+                    self.engine.get_tensor_mode(name) == trt.TensorIOMode.INPUT
+                    for name in self.tensor_name_list
+                ]
+            )
+            self.n_output = self.engine.num_io_tensors - self.n_input
 
-        for name, data in input_data.items():
-            if self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE:
-                self.context.set_input_shape(name, data.shape)
-            else:
-                self.context.set_tensor_address(name, data.ctypes.data)
-
-        # Prepare work before inference
-        for name in self.tensor_name_list:
-            data_type = self.engine.get_tensor_dtype(name)
-            runtime_shape = self.context.get_tensor_shape(name)
-            if name not in self.output_allocator_map:
-                if -1 in runtime_shape:
-                    # for Data-Dependent-Shape (DDS) output, "else" branch for normal output
-                    n_byte = 0  # self.context.get_max_output_size(name)
-                    self.output_allocator_map[name] = MyOutputAllocator()
-                    self.context.set_output_allocator(
-                        name, self.output_allocator_map[name]
-                    )
-                    host_buffer = np.empty(0, dtype=trt.nptype(data_type))
-                    device_buffer = None
+            for name, data in input_data.items():
+                if self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE:
+                    self.context.set_input_shape(name, data.shape)
                 else:
-                    n_byte = trt.volume(runtime_shape) * data_type.itemsize
-                    host_buffer = np.empty(runtime_shape, dtype=trt.nptype(data_type))
-                    if (
-                        self.engine.get_tensor_location(name)
-                        == trt.TensorLocation.DEVICE
-                    ):
-                        device_buffer = checkCudaErrors(cudart.cudaMalloc(n_byte))
-                    else:
+                    self.context.set_tensor_address(name, data.ctypes.data)
+
+            # Prepare work before inference
+            for name in self.tensor_name_list:
+                data_type = self.engine.get_tensor_dtype(name)
+                runtime_shape = self.context.get_tensor_shape(name)
+                if name not in self.output_allocator_map:
+                    if -1 in runtime_shape:
+                        # for Data-Dependent-Shape (DDS) output, "else" branch for normal output
+                        n_byte = 0  # self.context.get_max_output_size(name)
+                        self.output_allocator_map[name] = MyOutputAllocator()
+                        self.context.set_output_allocator(
+                            name, self.output_allocator_map[name]
+                        )
+                        host_buffer = np.empty(0, dtype=trt.nptype(data_type))
                         device_buffer = None
-                self.buffer[name] = [host_buffer, device_buffer, n_byte]
-            else:
-                # for DDS output, don't need to reallocate
-                pass
+                    else:
+                        n_byte = trt.volume(runtime_shape) * data_type.itemsize
+                        host_buffer = np.empty(runtime_shape, dtype=trt.nptype(data_type))
+                        if (
+                            self.engine.get_tensor_location(name)
+                            == trt.TensorLocation.DEVICE
+                        ):
+                            device_buffer = checkCudaErrors(cudart.cudaMalloc(n_byte))
+                        else:
+                            device_buffer = None
+                    self.buffer[name] = [host_buffer, device_buffer, n_byte]
+                else:
+                    # for DDS output, don't need to reallocate
+                    pass
 
-        for name, data in input_data.items():
-            self.buffer[name][0] = np.ascontiguousarray(data)
+            for name, data in input_data.items():
+                self.buffer[name][0] = np.ascontiguousarray(data)
 
-        for name in self.tensor_name_list:
-            if self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE:
-                if self.buffer[name][1] is not None:
-                    self.context.set_tensor_address(name, self.buffer[name][1])
-            elif self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
-                self.context.set_tensor_address(name, self.buffer[name][0].ctypes.data)
-
+            for name in self.tensor_name_list:
+                if self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE:
+                    if self.buffer[name][1] is not None:
+                        self.context.set_tensor_address(name, self.buffer[name][1])
+                elif self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT:
+                    self.context.set_tensor_address(name, self.buffer[name][0].ctypes.data)
+        except Exception:
+            # On failure, release lock to avoid deadlock
+            if self._in_txn:
+                self._in_txn = False
+                try:
+                    self._lock.release()
+                except RuntimeError:
+                    pass
+            raise
         return
 
     def infer(self, stream=0) -> None:
@@ -202,30 +218,36 @@ class TRTWrapper:
                     self.buffer[name][2],
                     cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
                 )
+        try:
+            self.context.execute_async_v3(stream)
 
-        self.context.execute_async_v3(stream)
+            for name in self.output_allocator_map:
+                myOutputAllocator = self.context.get_output_allocator(name)
+                runtime_shape = myOutputAllocator.shape
+                data_type = self.engine.get_tensor_dtype(name)
+                host_buffer = np.empty(runtime_shape, dtype=trt.nptype(data_type))
+                device_buffer = myOutputAllocator.address
+                n_bytes = trt.volume(runtime_shape) * data_type.itemsize
+                self.buffer[name] = [host_buffer, device_buffer, n_bytes]
 
-        for name in self.output_allocator_map:
-            myOutputAllocator = self.context.get_output_allocator(name)
-            runtime_shape = myOutputAllocator.shape
-            data_type = self.engine.get_tensor_dtype(name)
-            host_buffer = np.empty(runtime_shape, dtype=trt.nptype(data_type))
-            device_buffer = myOutputAllocator.address
-            n_bytes = trt.volume(runtime_shape) * data_type.itemsize
-            self.buffer[name] = [host_buffer, device_buffer, n_bytes]
-
-        for name in self.tensor_name_list:
-            if (
-                self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT
-                and self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE
-            ):
-                cudart.cudaMemcpy(
-                    self.buffer[name][0].ctypes.data,
-                    self.buffer[name][1],
-                    self.buffer[name][2],
-                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
-                )
-
+            for name in self.tensor_name_list:
+                if (
+                    self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT
+                    and self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE
+                ):
+                    cudart.cudaMemcpy(
+                        self.buffer[name][0].ctypes.data,
+                        self.buffer[name][1],
+                        self.buffer[name][2],
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                    )
+        finally:
+            if self._in_txn:
+                self._in_txn = False
+                try:
+                    self._lock.release()
+                except RuntimeError:
+                    pass
         return
 
     def infer_async(self, stream=0) -> None:
@@ -242,31 +264,37 @@ class TRTWrapper:
                     cudart.cudaMemcpyKind.cudaMemcpyHostToDevice,
                     stream=stream,
                 )
+        try:
+            self.context.execute_async_v3(stream)
 
-        self.context.execute_async_v3(stream)
+            for name in self.output_allocator_map:
+                myOutputAllocator = self.context.get_output_allocator(name)
+                runtime_shape = myOutputAllocator.shape
+                data_type = self.engine.get_tensor_dtype(name)
+                host_buffer = np.empty(runtime_shape, dtype=trt.nptype(data_type))
+                device_buffer = myOutputAllocator.address
+                n_bytes = trt.volume(runtime_shape) * data_type.itemsize
+                self.buffer[name] = [host_buffer, device_buffer, n_bytes]
 
-        for name in self.output_allocator_map:
-            myOutputAllocator = self.context.get_output_allocator(name)
-            runtime_shape = myOutputAllocator.shape
-            data_type = self.engine.get_tensor_dtype(name)
-            host_buffer = np.empty(runtime_shape, dtype=trt.nptype(data_type))
-            device_buffer = myOutputAllocator.address
-            n_bytes = trt.volume(runtime_shape) * data_type.itemsize
-            self.buffer[name] = [host_buffer, device_buffer, n_bytes]
-
-        for name in self.tensor_name_list:
-            if (
-                self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT
-                and self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE
-            ):
-                cudart.cudaMemcpyAsync(
-                    self.buffer[name][0].ctypes.data,
-                    self.buffer[name][1],
-                    self.buffer[name][2],
-                    cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
-                    stream=stream,
-                )
-
+            for name in self.tensor_name_list:
+                if (
+                    self.engine.get_tensor_mode(name) == trt.TensorIOMode.OUTPUT
+                    and self.engine.get_tensor_location(name) == trt.TensorLocation.DEVICE
+                ):
+                    cudart.cudaMemcpyAsync(
+                        self.buffer[name][0].ctypes.data,
+                        self.buffer[name][1],
+                        self.buffer[name][2],
+                        cudart.cudaMemcpyKind.cudaMemcpyDeviceToHost,
+                        stream=stream,
+                    )
+        finally:
+            if self._in_txn:
+                self._in_txn = False
+                try:
+                    self._lock.release()
+                except RuntimeError:
+                    pass
         return
 
     def __del__(self):
