@@ -93,12 +93,17 @@ class AudioPusher(threading.Thread):
         self._quit.set()
 
     def run(self):
-        # If initial data provided, queue it
-        if self._data is not None and isinstance(self._data, np.ndarray) and self._data.size > 0:
-            with self._cond:
+        # If initial data provided, queue a small head silence (~205ms) first,
+        # then the real audio. This helps align audio playout start with the
+        # video pipeline's initial context which includes leading silence.
+        head_silence_samples = int(0.205 * self.sample_rate)
+        with self._cond:
+            if head_silence_samples > 0:
+                self._buffer_list.append(np.zeros((head_silence_samples,), dtype=np.float32))
+            if self._data is not None and isinstance(self._data, np.ndarray) and self._data.size > 0:
                 self._buffer_list.append(self._data.astype(np.float32))
                 self._data = None
-                self._cond.notify_all()
+            self._cond.notify_all()
 
         ptime = self.chunk / float(self.sample_rate)  # 20ms pacing
         start = time.time()

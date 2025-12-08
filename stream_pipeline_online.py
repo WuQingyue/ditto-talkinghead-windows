@@ -245,6 +245,7 @@ class StreamSDK:
         self._incoming_buffer = np.zeros((0,), dtype=np.float32)
         self._prev_tail = np.zeros((self._overlap_len,), dtype=np.float32)
         self._next_emit_time = None
+        self._first_block_done = False
 
         # ======== Setup Worker Threads ========
         QUEUE_MAX_SIZE = 100
@@ -583,10 +584,30 @@ class StreamSDK:
             if take < need_new:
                 pad = np.zeros((need_new - take,), dtype=np.float32)
                 new_samples = np.concatenate([new_samples, pad], 0) if take > 0 else pad
-            block = np.concatenate([self._prev_tail, new_samples], 0)
-            if block.shape[0] < self._split_len:
-                pad2 = np.zeros((self._split_len - block.shape[0],), dtype=np.float32)
-                block = np.concatenate([block, pad2], 0)
+
+            # 构造当前 block
+            if not self._first_block_done:
+                # 第一块：如果真实音频总长度不足一个 _split_len，则前静音、后真实音频
+                real_len = int(take)
+                if real_len < self._split_len:
+                    block = np.zeros((self._split_len,), dtype=np.float32)
+                    if real_len > 0:
+                        # 将真实音频对齐放在 block 的尾部
+                        block[-real_len:] = new_samples[:real_len]
+                else:
+                    # 真实音频已经够长，退回到原有逻辑
+                    block = np.concatenate([self._prev_tail, new_samples], 0)
+                    if block.shape[0] < self._split_len:
+                        pad2 = np.zeros((self._split_len - block.shape[0],), dtype=np.float32)
+                        block = np.concatenate([block, pad2], 0)
+                self._first_block_done = True
+            else:
+                # 后续块保持原有逻辑：前接上一块 tail，尾部不足时在后面补静音
+                block = np.concatenate([self._prev_tail, new_samples], 0)
+                if block.shape[0] < self._split_len:
+                    pad2 = np.zeros((self._split_len - block.shape[0],), dtype=np.float32)
+                    block = np.concatenate([block, pad2], 0)
+
             self._prev_tail = block[-self._overlap_len:]
             self.run_chunk(block.astype(np.float32), chunksize=self.chunksize)
             self._next_emit_time += emit_dt
