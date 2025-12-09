@@ -1,10 +1,3 @@
-###############################################################################
-#  Integrate Ditto StreamSDK pipeline with WebRTC (aiortc) through BaseReal
-#
-#  This adapter reuses the existing stream_pipeline_online.py workers, but
-#  replaces the file writer with a WebRTC writer and pushes audio in 20ms chunks
-#  to the aiortc audio track.
-###############################################################################
 
 import asyncio
 import time
@@ -75,10 +68,11 @@ class WebRTCVideoWriter:
 
 
 class AudioPusher(threading.Thread):
-    def __init__(self, loop, audio_track, wav_path=None, sample_rate=16000, chunk_samples=320, data: np.ndarray | None = None):
+    def __init__(self, loop, audio_track, sdk, wav_path=None, sample_rate=16000, chunk_samples=320, data: np.ndarray | None = None):
         super().__init__(daemon=True)
         self.loop = loop
         self.audio_track = audio_track
+        self.sdk = sdk
         self.wav_path = wav_path
         self.sample_rate = sample_rate
         self.chunk = chunk_samples
@@ -88,18 +82,15 @@ class AudioPusher(threading.Thread):
         self._lock = threading.Lock()
         self._cond = threading.Condition(self._lock)
         self._buffer_list: list[np.ndarray] = []  # list of float32 mono 16k arrays
+        # unified audio buffer for timeline-based chunking
+        self._audio_buffer = np.zeros((0,), dtype=np.float32)
 
     def stop(self):
         self._quit.set()
 
     def run(self):
-        # If initial data provided, queue a small head silence (~205ms) first,
-        # then the real audio. This helps align audio playout start with the
-        # video pipeline's initial context which includes leading silence.
-        head_silence_samples = int(0.205 * self.sample_rate)
+        # If initial data provided, queue it directly without adding extra head silence
         with self._cond:
-            if head_silence_samples > 0:
-                self._buffer_list.append(np.zeros((head_silence_samples,), dtype=np.float32))
             if self._data is not None and isinstance(self._data, np.ndarray) and self._data.size > 0:
                 self._buffer_list.append(self._data.astype(np.float32))
                 self._data = None
@@ -108,32 +99,43 @@ class AudioPusher(threading.Thread):
         ptime = self.chunk / float(self.sample_rate)  # 20ms pacing
         start = time.time()
         sent_chunks = 0
-        cur: np.ndarray | None = None
-        idx = 0
         while not self._quit.is_set():
-            if cur is None or idx >= len(cur):
-                # fetch next buffer or wait
-                with self._cond:
-                    while not self._quit.is_set() and len(self._buffer_list) == 0:
-                        self._cond.wait(timeout=0.1)
-                    if self._quit.is_set():
-                        break
-                    cur = self._buffer_list.pop(0)
-                    idx = 0
-                    start = time.time()
-                    sent_chunks = 0
-            # send one chunk (with tail padding inside the buffer)
-            end = min(idx + self.chunk, len(cur))
-            chunk = cur[idx:end]
-            if len(chunk) < self.chunk:
-                pad = np.zeros((self.chunk - len(chunk),), dtype=np.float32)
-                chunk = np.concatenate([chunk, pad], 0)
+            # merge any newly uploaded buffers into unified audio buffer
+            with self._cond:
+                while len(self._buffer_list) > 0:
+                    buf = self._buffer_list.pop(0)
+                    if buf is not None and buf.size > 0:
+                        self._audio_buffer = np.concatenate([self._audio_buffer, buf.astype(np.float32)], 0)
+
+            # decide what to send on this 20ms tick
+            if self._audio_buffer.shape[0] >= self.chunk:
+                # full chunk of real audio
+                chunk = self._audio_buffer[:self.chunk]
+                self._audio_buffer = self._audio_buffer[self.chunk:]
+            elif self._audio_buffer.shape[0] > 0:
+                # partial audio: send remaining samples and pad with silence
+                remain = self._audio_buffer
+                pad_len = self.chunk - remain.shape[0]
+                pad = np.zeros((pad_len,), dtype=np.float32)
+                chunk = np.concatenate([remain, pad], 0)
+                self._audio_buffer = np.zeros((0,), dtype=np.float32)
+            else:
+                # no data at all: send a full silent chunk
+                chunk = np.zeros((self.chunk,), dtype=np.float32)
+
+            # 同一条 20ms 音频时间轴：先将 float32 mono 16kHz 块送入 SDK，再送入 WebRTC
+            try:
+                if self.sdk is not None and hasattr(self.sdk, 'push_audio_chunk'):
+                    self.sdk.push_audio_chunk(chunk.astype(np.float32), sr=self.sample_rate)
+            except Exception:
+                # 避免音频推送异常导致线程退出
+                pass
             s16 = (chunk * 32767.0).astype(np.int16)
             af = AudioFrame(format='s16', layout='mono', samples=self.chunk)
             af.planes[0].update(s16.tobytes())
             af.sample_rate = self.sample_rate
             asyncio.run_coroutine_threadsafe(self.audio_track._queue.put((af, None)), self.loop)
-            idx += self.chunk
+
             sent_chunks += 1
             target_time = start + sent_chunks * ptime
             delay = target_time - time.time()
@@ -181,14 +183,11 @@ class DittoReal(BaseReal):
     # allow runtime setting of audio path per session
     def set_audio_path(self, path: str):
         self._audio_path = path
-        # If SDK is already running, push this newly uploaded audio into scheduler immediately
+        # If SDK is already running, we rely on the 20ms streaming path (AudioPusher)
+        # to feed exactly the same audio samples to both SDK and WebRTC.
+        # New uploads are therefore only appended into AudioPusher, which will
+        # slice them into 20ms chunks and call sdk.push_audio_chunk for each.
         try:
-            sdk = getattr(self, '_sdk', None)
-            if sdk is not None and hasattr(sdk, 'push_audio_file_bytes'):
-                with open(path, 'rb') as f:
-                    file_bytes = f.read()
-                sdk.push_audio_file_bytes(file_bytes)
-            # Also append to webrtc audio pusher for audible playback
             if self._audio_pusher is not None:
                 try:
                     data, sr = sf.read(path, dtype='float32')
@@ -248,21 +247,11 @@ class DittoReal(BaseReal):
         sdk.setup(source_path, "unused_output_path_from_webrtc", writer=webrtc_writer)
         sdk.setup_Nd(N_d=n_frames, fade_in=-1, fade_out=-1, ctrl_info={})
 
-        # 4) Start audio pusher to webrtc, queue initial audio; later uploads will be appended
-        self._audio_pusher = AudioPusher(loop, audio_track, audio_path, data=audio)
+        # 4) Start audio pusher to webrtc & sdk, queue initial audio; later uploads will be appended
+        self._audio_pusher = AudioPusher(loop, audio_track, sdk, audio_path, data=audio)
         self._audio_pusher.start()
 
-        # 5) Feed audio to StreamSDK scheduler as bytes; do NOT signal EOF.
-        # This allows continuous video with silence after audio ends, and supports multiple uploads.
-        try:
-            with open(audio_path, 'rb') as f:
-                file_bytes = f.read()
-            sdk.push_audio_file_bytes(file_bytes)
-        except Exception:
-            # Fallback: push from in-memory ndarray if file reading fails
-            sdk.push_audio_chunk(audio, sr=16000)
-
-        # 6) Wait until quit_event is set, then close everything
+        # 5) Wait until quit_event is set, then close everything
         try:
             while not quit_event.is_set():
                 time.sleep(0.1)

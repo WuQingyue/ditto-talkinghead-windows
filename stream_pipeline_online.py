@@ -238,7 +238,8 @@ class StreamSDK:
         # ======== Audio Block Scheduler ========
         self.sample_rate = 16000
         self.chunksize = kwargs.get("chunksize", (3, 5, 2))
-        self._split_len = int(sum(self.chunksize) * 0.04 * self.sample_rate) + 80
+        # use an exact 400ms analysis window (10 * 40ms) so that it is an integer multiple of 20ms audio ticks
+        self._split_len = int(sum(self.chunksize) * 0.04 * self.sample_rate)
         self._step_len = int(self.chunksize[1] * 0.04 * self.sample_rate)
         self._overlap_len = self._split_len - self._step_len
         self._sched_lock = threading.Lock()
@@ -575,38 +576,30 @@ class StreamSDK:
             if sleep_t > 0:
                 time.sleep(min(sleep_t, 0.01))
                 continue
-            need_new = self._step_len
+            # 首块使用完整窗口长度 _split_len；之后按照步长 _step_len 滑动
+            need_new = self._split_len if not self._first_block_done else self._step_len
             with self._sched_lock:
                 avail = int(self._incoming_buffer.shape[0])
-                take = min(avail, need_new)
-                new_samples = self._incoming_buffer[:take]
-                self._incoming_buffer = self._incoming_buffer[take:]
-            if take < need_new:
-                pad = np.zeros((need_new - take,), dtype=np.float32)
-                new_samples = np.concatenate([new_samples, pad], 0) if take > 0 else pad
+                if avail < need_new:
+                    # not enough audio yet, keep buffering without padding
+                    new_samples = None
+                else:
+                    new_samples = self._incoming_buffer[:need_new]
+                    self._incoming_buffer = self._incoming_buffer[need_new:]
+
+            # if we still don't have enough samples, wait for more audio
+            if new_samples is None:
+                time.sleep(0.01)
+                continue
 
             # 构造当前 block
             if not self._first_block_done:
-                # 第一块：如果真实音频总长度不足一个 _split_len，则前静音、后真实音频
-                real_len = int(take)
-                if real_len < self._split_len:
-                    block = np.zeros((self._split_len,), dtype=np.float32)
-                    if real_len > 0:
-                        # 将真实音频对齐放在 block 的尾部
-                        block[-real_len:] = new_samples[:real_len]
-                else:
-                    # 真实音频已经够长，退回到原有逻辑
-                    block = np.concatenate([self._prev_tail, new_samples], 0)
-                    if block.shape[0] < self._split_len:
-                        pad2 = np.zeros((self._split_len - block.shape[0],), dtype=np.float32)
-                        block = np.concatenate([block, pad2], 0)
+                # first block uses exactly _split_len samples; ensured by need_new
+                block = new_samples
                 self._first_block_done = True
             else:
-                # 后续块保持原有逻辑：前接上一块 tail，尾部不足时在后面补静音
+                # 后续块保持原有逻辑：前接上一块 tail
                 block = np.concatenate([self._prev_tail, new_samples], 0)
-                if block.shape[0] < self._split_len:
-                    pad2 = np.zeros((self._split_len - block.shape[0],), dtype=np.float32)
-                    block = np.concatenate([block, pad2], 0)
 
             self._prev_tail = block[-self._overlap_len:]
             self.run_chunk(block.astype(np.float32), chunksize=self.chunksize)
