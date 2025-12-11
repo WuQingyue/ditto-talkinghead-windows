@@ -130,10 +130,26 @@ async def offer(request):
         if pc.connectionState == "failed":
             await pc.close()
             pcs.discard(pc)
-            del nerfreals[sessionid]
+            # cleanup nerfreals and uploaded files for this session
+            try:
+                if sessionid in nerfreals:
+                    del nerfreals[sessionid]
+                upload_dir = os.path.join('data', 'uploads', str(sessionid))
+                if os.path.isdir(upload_dir):
+                    shutil.rmtree(upload_dir, ignore_errors=True)
+            except Exception:
+                logger.exception('failed to cleanup session resources')
         if pc.connectionState == "closed":
             pcs.discard(pc)
-            del nerfreals[sessionid]
+            # cleanup nerfreals and uploaded files for this session
+            try:
+                if sessionid in nerfreals:
+                    del nerfreals[sessionid]
+                upload_dir = os.path.join('data', 'uploads', str(sessionid))
+                if os.path.isdir(upload_dir):
+                    shutil.rmtree(upload_dir, ignore_errors=True)
+            except Exception:
+                logger.exception('failed to cleanup session resources')
             # gc.collect()
 
     player = HumanPlayer(nerfreals[sessionid])
