@@ -5,11 +5,14 @@ import threading
 import numpy as np
 import soundfile as sf
 import librosa
+import io
+import os
 
 from av import VideoFrame, AudioFrame
 
 from basereal import BaseReal
 from stream_pipeline_online import StreamSDK
+from logger import logger
 
 
 class _TTSEmpty:
@@ -61,10 +64,6 @@ class WebRTCVideoWriter:
                 self.count += to_pad
         except Exception:
             pass
-        try:
-            asyncio.run_coroutine_threadsafe(self.video_track._queue.put((None, 'eof_video')), self.loop)
-        except Exception:
-            pass
 
 
 class AudioPusher(threading.Thread):
@@ -87,6 +86,18 @@ class AudioPusher(threading.Thread):
 
     def stop(self):
         self._quit.set()
+
+    def flush(self):
+        """Clear any queued audio so that subsequent chunks start fresh.
+
+        This is called from higher-level interrupt handlers (flush_talk).
+        It does NOT stop the thread; it only wipes the current audio buffers
+        so new uploads won't be mixed with old ones.
+        """
+        with self._cond:
+            self._buffer_list.clear()
+            self._audio_buffer = np.zeros((0,), dtype=np.float32)
+            self._cond.notify_all()
 
     def run(self):
         # If initial data provided, queue it directly without adding extra head silence
@@ -169,16 +180,12 @@ class DittoReal(BaseReal):
         # placeholders for sdk and threads
         self._sdk = None
         self._audio_pusher = None
-        self._source_path = None  # uploaded source path per session
         self._audio_path = None   # uploaded audio path per session
+        self._avatar_id = avatar
 
     def paste_back_frame(self, pred_frame, idx: int):
         # Not used in this adapter; frames are composed inside StreamSDK
         return pred_frame
-
-    # allow runtime setting of source path (image/video) per session
-    def set_source_path(self, path: str):
-        self._source_path = path
 
     # allow runtime setting of audio path per session
     def set_audio_path(self, path: str):
@@ -198,7 +205,45 @@ class DittoReal(BaseReal):
             # non-fatal; initial render loop will still consume _audio_path if needed
             pass
 
+    def _resolve_source_from_avatar(self):
+        if not getattr(self, "_avatar_id", None):
+            return ""
+        # Prefer LiveTalking-style avatar folder layout:
+        #   <ditto_avatar_root>/<avatar_id>/full_imgs/00000001.png
+        # so that we can reuse the same assets as LightReal.
+        root = getattr(self.opt, "ditto_avatar_root", "./data/avatars")
+        avatar_root = os.path.join(root, str(self._avatar_id))
+        exts = [".png", ".jpg", ".jpeg", ".bmp", ".mp4", ".avi", ".mov"]
+
+        # 1) Try full_imgs subfolder first (compatible with LightReal/LightTalking assets)
+        full_imgs_dir = os.path.join(avatar_root, "full_imgs")
+        if os.path.isdir(full_imgs_dir):
+            candidates: list[str] = []
+            for ext in exts:
+                # collect all matching files and pick the first in sorted order
+                for name in sorted(os.listdir(full_imgs_dir)):
+                    if name.lower().endswith(ext):
+                        candidates.append(os.path.join(full_imgs_dir, name))
+            if candidates:
+                return candidates[0]
+
+        # 2) Fallback to flat files under <ditto_avatar_root>/<avatar_id>.<ext>
+        base = os.path.join(root, str(self._avatar_id))
+        for ext in exts:
+            p = base + ext
+            if os.path.isfile(p):
+                return p
+        return ""
+
     def render(self, quit_event, loop=None, audio_track=None, video_track=None):
+        # Validate WebRTC parameters
+        if loop is None:
+            raise RuntimeError("WebRTC loop is required but was None. This should be provided by HumanPlayer.")
+        if audio_track is None:
+            raise RuntimeError("WebRTC audio_track is required but was None. This should be provided by HumanPlayer.")
+        if video_track is None:
+            raise RuntimeError("WebRTC video_track is required but was None. This should be provided by HumanPlayer.")
+        
         # 1) Build StreamSDK from opt
         # validate required options
         required = ['ditto_cfg_pkl', 'ditto_data_root', 'ditto_audio']
@@ -207,15 +252,15 @@ class DittoReal(BaseReal):
                 raise RuntimeError(f"Missing required option: {k}. Please start app.py with --{k}.")
         if not self.opt.ditto_cfg_pkl or not self.opt.ditto_data_root:
             raise RuntimeError("Ditto cfg/data_root not set. Provide --ditto_cfg_pkl and --ditto_data_root.")
-        # decide source path: uploaded first, else CLI; if missing, wait for frontend upload
-        source_path = self._source_path or getattr(self.opt, 'ditto_source', '')
+        # decide source path purely from avatar_id mapping
+        source_path = self._resolve_source_from_avatar()
         if not source_path:
-            t0 = time.time()
-            while not quit_event.is_set() and (time.time() - t0) < 60.0 and not self._source_path:
-                time.sleep(0.2)
-            source_path = self._source_path or getattr(self.opt, 'ditto_source', '')
-            if not source_path:
-                raise RuntimeError("Source is empty. Upload a source file or start with --ditto_source.")
+            raise RuntimeError("Source is empty. Please make sure avatar_id is set and avatar assets exist under ditto_avatar_root.")
+        # log resolved source for debugging
+        try:
+            logger.info("[DittoReal] Resolved source_path for avatar_id %s: %s", getattr(self, "_avatar_id", None), source_path)
+        except Exception:
+            pass
         # decide audio path: uploaded first, else CLI; if missing, wait for frontend upload
         audio_path = self._audio_path or getattr(self.opt, 'ditto_audio', '')
         if not audio_path:
@@ -225,43 +270,60 @@ class DittoReal(BaseReal):
             audio_path = self._audio_path or getattr(self.opt, 'ditto_audio', '')
             if not audio_path:
                 raise RuntimeError("Audio is empty. Upload an audio file or start with --ditto_audio.")
-        sdk = StreamSDK(self.opt.ditto_cfg_pkl, self.opt.ditto_data_root)
-        self._sdk = sdk
-
-        # 2) Determine N_d from audio length at 25fps (use the same audio array for both SDK and pusher)
-        audio, sr = librosa.core.load(audio_path, sr=16000)
-        # ensure mono float32 ndarray at 16k
-        if audio.ndim > 1:
-            audio = audio[0, :]
-        # Zero-pad to a whole number of 20ms chunks to align features with playout tail
-        rem = len(audio) % 320
-        if rem != 0:
-            audio = np.concatenate([audio, np.zeros(320 - rem, dtype=audio.dtype)], axis=0)
-        # Compute N_d based on actual 20ms audio chunks to cover the same playout duration
-        n_chunks = int(len(audio) / 320)  # exact integer after padding
-        n_frames = int(np.ceil(n_chunks / 2.0))      # 40ms per video frame (~25fps)
-
-        # 3) Setup SDK (always offline pipeline). Inject WebRTC writer here.
-        # Do not enable tail padding: expected_frames=None disables close-time padding
-        webrtc_writer = WebRTCVideoWriter(loop, video_track, expected_frames=None)
-        sdk.setup(source_path, "unused_output_path_from_webrtc", writer=webrtc_writer)
-        sdk.setup_Nd(N_d=n_frames, fade_in=-1, fade_out=-1, ctrl_info={})
-
-        # 4) Start audio pusher to webrtc & sdk, queue initial audio; later uploads will be appended
-        self._audio_pusher = AudioPusher(loop, audio_track, sdk, audio_path, data=audio)
-        self._audio_pusher.start()
-
-        # 5) Wait until quit_event is set, then close everything
+        
+        sdk = None
+        self._audio_pusher = None
         try:
+            sdk = StreamSDK(self.opt.ditto_cfg_pkl, self.opt.ditto_data_root)
+            self._sdk = sdk
+
+            # 2) Determine N_d from audio length at 25fps (use the same audio array for both SDK and pusher)
+            audio, sr = librosa.core.load(audio_path, sr=16000)
+            # ensure mono float32 ndarray at 16k
+            if audio.ndim > 1:
+                audio = audio[0, :]
+            # Zero-pad to a whole number of 20ms chunks to align features with playout tail
+            rem = len(audio) % 320
+            if rem != 0:
+                audio = np.concatenate([audio, np.zeros(320 - rem, dtype=audio.dtype)], axis=0)
+            # Compute N_d based on actual 20ms audio chunks to cover the same playout duration
+            n_chunks = int(len(audio) / 320)  # exact integer after padding
+            n_frames = int(np.ceil(n_chunks / 2.0))      # 40ms per video frame (~25fps)
+
+            # 3) Setup SDK (always offline pipeline). Inject WebRTC writer here.
+            # Do not enable tail padding: expected_frames=None disables close-time padding
+            webrtc_writer = WebRTCVideoWriter(loop, video_track, expected_frames=None)
+            # Pass N_d in kwargs so motion_stitch.setup() gets the correct value
+            sdk.setup(source_path, "unused_output_path_from_webrtc", writer=webrtc_writer, N_d=n_frames)
+            # setup_Nd is still needed to set fade_in/fade_out and ctrl_info
+            sdk.setup_Nd(N_d=n_frames, fade_in=-1, fade_out=-1, ctrl_info={})
+
+            # 4) Start audio pusher to webrtc & sdk, queue initial audio; later uploads will be appended
+            self._audio_pusher = AudioPusher(loop, audio_track, sdk, audio_path, data=audio)
+            self._audio_pusher.start()
+
+            # 5) Wait until quit_event is set, then close everything
             while not quit_event.is_set():
                 time.sleep(0.1)
         finally:
             # signal pipeline to flush
-            try:
-                sdk.close()
-            except Exception:
-                pass
+            if sdk is not None:
+                try:
+                    sdk.close()
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
             # stop audio pusher
-            if self._audio_pusher:
-                self._audio_pusher.stop()
-                self._audio_pusher.join()
+            if self._audio_pusher is not None:
+                try:
+                    self._audio_pusher.stop()
+                    self._audio_pusher.join(timeout=5.0)  # Add timeout to avoid hanging
+                except Exception as e:
+                    import traceback
+                    traceback.print_exc()
+            # Close WebRTC writer if it exists
+            if sdk is not None and hasattr(sdk, 'writer') and sdk.writer is not None:
+                try:
+                    sdk.writer.close()
+                except Exception:
+                    pass

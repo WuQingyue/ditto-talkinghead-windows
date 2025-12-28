@@ -1,41 +1,9 @@
 import os as _os
 _os.environ['KMP_DUPLICATE_LIB_OK'] = 'TRUE'
 
-async def humansource(request):
-    try:
-        form = await request.post()
-        sessionid = int(form.get('sessionid', 0))
-        fileobj = form["file"]
-        filename = fileobj.filename
-        filebytes = fileobj.file.read()
-        # save to per-session upload dir
-        upload_dir = os.path.join('data', 'uploads', str(sessionid))
-        os.makedirs(upload_dir, exist_ok=True)
-        save_path = os.path.join(upload_dir, filename)
-        with open(save_path, 'wb') as f:
-            f.write(filebytes)
-        # set source path on DittoReal instance
-        if nerfreals.get(sessionid) is not None and hasattr(nerfreals[sessionid], 'set_source_path'):
-            nerfreals[sessionid].set_source_path(save_path)
-
-        return web.Response(
-            content_type="application/json",
-            text=json.dumps(
-                {"code": 0, "msg": "ok", "path": save_path}
-            ),
-        )
-    except Exception as e:
-        logger.exception('exception:')
-        return web.Response(
-            content_type="application/json",
-            text=json.dumps(
-                {"code": -1, "msg": str(e)}
-            ),
-        )
-
 # server.py
 from flask import Flask, render_template,send_from_directory,request, jsonify
-from flask_sockets import Sockets
+#from flask_sockets import Sockets
 import base64
 import json
 #import gevent
@@ -96,8 +64,8 @@ def randN(N)->int:
 
 def build_nerfreal(sessionid:int)->BaseReal:
     opt.sessionid=sessionid
-    from ditto_real import DittoReal
-    nerfreal = DittoReal(opt, None, None)
+    from ditto import DittoReal
+    nerfreal = DittoReal(opt, None, opt.avatar_id)
     return nerfreal
 
 #@app.route('/offer', methods=['POST'])
@@ -259,48 +227,92 @@ async def human(request):
             ),
         )
 
-async def interrupt_talk(request):
+async def humanaudio(request):
     try:
-        params = await request.json()
+        logger.info("[humanaudio] 收到请求: method=%s, content_type=%s", request.method, request.content_type)
+        logger.info("[humanaudio] 请求头部部分信息: %s", dict(list(request.headers.items())[:10]))
 
-        sessionid = params.get('sessionid',0)
-        nerfreals[sessionid].flush_talk()
-        
+        form = await request.post()
+        logger.info("[humanaudio] 解析到的表单字段 keys: %s", list(form.keys()))
+
+        raw_sessionid = form.get('sessionid', 0)
+        try:
+            sessionid = int(raw_sessionid)
+        except (TypeError, ValueError):
+            logger.info("[humanaudio] sessionid 无法转换为 int, 原始值=%r", raw_sessionid)
+            sessionid = 0
+
+        logger.info("[humanaudio] 解析到的 sessionid=%s, 是否在 nerfreals 中: %s", sessionid, sessionid in nerfreals)
+
+        upload_path = None
+        upload_dir = None
+        if 'file' in form:
+            fileobj = form["file"]
+            filename = getattr(fileobj, 'filename', None)
+            file_stream = getattr(fileobj, 'file', None)
+            reported_size = getattr(fileobj, 'size', None)
+            logger.info("[humanaudio] 收到文件字段, filename=%s, fileobj_type=%s, file_stream_type=%s, reported_size=%s",
+                        filename, type(fileobj), type(file_stream), reported_size)
+
+            # 将上传的音频文件落盘到 uploads/<sessionid>/ 目录
+            if file_stream is not None and sessionid in nerfreals:
+                try:
+                    upload_dir = os.path.join('uploads', str(sessionid))
+                    os.makedirs(upload_dir, exist_ok=True)
+                    safe_name = filename or 'upload.wav'
+                    upload_path = os.path.join(upload_dir, safe_name)
+                    with open(upload_path, 'wb') as f:
+                        while True:
+                            chunk = file_stream.read(8192)
+                            if not chunk:
+                                break
+                            f.write(chunk)
+                    logger.info("[humanaudio] 音频已保存到: %s", upload_path)
+                except Exception:
+                    logger.exception("[humanaudio] 保存上传音频到磁盘时异常")
+
+        interrupt_value = form.get('interrupt')
+        logger.info("[humanaudio] 收到 interrupt 字段原始值=%r", interrupt_value)
+
+        # Check if the value is the boolean True OR the string 'true' (case-insensitive)
+        if interrupt_value is True or str(interrupt_value).lower() == 'true':
+            logger.info("[humanaudio] interrupt 标志为真, 尝试打断当前说话 (sessionid=%s)", sessionid)
+            if sessionid in nerfreals:
+                try:
+                    nerfreals[sessionid].flush_talk()
+                    logger.info("[humanaudio] 已调用 nerfreals[%s].flush_talk()", sessionid)
+                except Exception:
+                    logger.exception("[humanaudio] 调用 flush_talk 时异常")
+            else:
+                logger.info("[humanaudio] sessionid=%s 不在 nerfreals 中, 无法 flush_talk", sessionid)
+
+            # 中断模式下，删除该会话目录下除本次最新音频外的其它文件
+            if upload_dir and upload_path:
+                try:
+                    for name in os.listdir(upload_dir):
+                        full_path = os.path.join(upload_dir, name)
+                        if full_path != upload_path and os.path.isfile(full_path):
+                            try:
+                                os.remove(full_path)
+                            except Exception:
+                                logger.exception("[humanaudio] 删除旧音频文件失败: %s", full_path)
+                except Exception:
+                    logger.exception("[humanaudio] 清理旧音频文件时异常, upload_dir=%s", upload_dir)
+
+        # 在可能的 flush_talk() 之后再把最新音频推入 Ditto 模型，避免被清空
+        if upload_path and sessionid in nerfreals:
+            try:
+                nerfreals[sessionid].set_audio_path(upload_path)
+                logger.info("[humanaudio] 最终调用 nerfreals[%s].set_audio_path, path=%s", sessionid, upload_path)
+            except Exception:
+                logger.exception("[humanaudio] 调用 set_audio_path 时异常")
+
+        logger.info("[humanaudio] 处理完成, 即将返回成功响应")
+
         return web.Response(
             content_type="application/json",
             text=json.dumps(
                 {"code": 0, "msg":"ok"}
-            ),
-        )
-    except Exception as e:
-        logger.exception('exception:')
-        return web.Response(
-            content_type="application/json",
-            text=json.dumps(
-                {"code": -1, "msg": str(e)}
-            ),
-        )
-
-async def humanaudio(request):
-    try:
-        form= await request.post()
-        sessionid = int(form.get('sessionid',0))
-        fileobj = form["file"]
-        filename=fileobj.filename
-        filebytes=fileobj.file.read()
-        # save uploaded audio and set path for DittoReal
-        upload_dir = os.path.join('data', 'uploads', str(sessionid))
-        os.makedirs(upload_dir, exist_ok=True)
-        save_path = os.path.join(upload_dir, filename)
-        with open(save_path, 'wb') as f:
-            f.write(filebytes)
-        if nerfreals.get(sessionid) is not None and hasattr(nerfreals[sessionid], 'set_audio_path'):
-            nerfreals[sessionid].set_audio_path(save_path)
-
-        return web.Response(
-            content_type="application/json",
-            text=json.dumps(
-                {"code": 0, "msg":"ok", "path": save_path}
             ),
         )
     except Exception as e:
@@ -478,10 +490,8 @@ if __name__ == '__main__':
     appasync.router.add_post("/offer", offer)
     appasync.router.add_post("/human", human)
     appasync.router.add_post("/humanaudio", humanaudio)
-    appasync.router.add_post("/humansource", humansource)
     appasync.router.add_post("/set_audiotype", set_audiotype)
     appasync.router.add_post("/record", record)
-    appasync.router.add_post("/interrupt_talk", interrupt_talk)
     appasync.router.add_post("/is_speaking", is_speaking)
     appasync.router.add_static('/',path='web')
 
@@ -497,14 +507,14 @@ if __name__ == '__main__':
     for route in list(appasync.router.routes()):
         cors.add(route)
 
-    pagename='webrtcapi-asr.html'
+    pagename='webrtcapi.html'
     if opt.transport=='rtmp':
         pagename='echoapi.html'
     elif opt.transport=='rtcpush':
         pagename='rtcpushapi.html'
 
     logger.info('start http server; http://<serverip>:'+str(opt.listenport)+'/'+pagename)
-    logger.info('如果使用webrtc，推荐访问webrtc集成前端: http://<serverip>:'+str(opt.listenport)+'/dashboard.html')
+    logger.info('如果使用webrtc，推荐访问webrtc集成前端: http://<serverip>:'+str(opt.listenport)+'/webrtc-embed.html')
     def run_server(runner):
         loop = asyncio.new_event_loop()
         asyncio.set_event_loop(loop)

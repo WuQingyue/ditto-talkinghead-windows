@@ -1,0 +1,242 @@
+<!DOCTYPE html>
+<html>
+<head>
+    <meta charset="UTF-8"/>
+    <meta name="viewport" content="width=device-width, initial-scale=1.0" />
+    <title>WebRTC webcam</title>
+    <style>
+        /* --- START: Embed Mode 核心样式 --- */
+        /* 当 body 含有 embed-mode 类时，应用这些规则 */
+        /* 规则1：隐藏 body 的所有直接子元素，除了 #media 容器和 script 标签 */
+        body.embed-mode>*:not(#media):not(script) {
+            display: none !important;
+        }
+
+        /* 规则2：移除 body 的边距，并隐藏滚动条，让 #media 填满整个视口 */
+        body.embed-mode {
+            margin: 0;
+            padding: 0;
+            overflow: hidden;
+        }
+
+        /* 规则3：让 #media 容器本身占满整个 iframe，并使其背景透明 */
+        body.embed-mode #media {
+            position: relative;
+            /* 为 loading 动画定位 */
+            height: 100vh;
+            /* 高度占满视口 */
+            max-width: none;
+            /* 取消最大宽度限制 */
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            background-color: transparent;
+            /* 背景透明，融入父页面 */
+        }
+
+        /* 规则4：在嵌入模式下隐藏 "Media" 标题 */
+        body.embed-mode #media h2 {
+            display: none;
+        }
+
+        /* 规则5：让视频在容器内保持比例缩放并居中 */
+        body.embed-mode #video {
+            width: 100%;
+            height: 100%;
+            object-fit: contain;
+            /* 保持宽高比，完整显示 */
+        }
+        /* --- END: Embed Mode 核心样式 --- */
+
+        /* --- 原有样式 --- */
+        button {
+            padding: 8px 16px;
+        }
+
+        video {
+            width: 100%;
+        }
+
+        .option {
+            margin-bottom: 8px;
+        }
+
+        #media {
+            max-width: 1280px;
+        }
+
+        #loading-overlay {
+            position: absolute;
+            top: 0;
+            left: 0;
+            width: 100%;
+            height: 100%;
+            display: none;
+            /* 默认隐藏 */
+            justify-content: center;
+            align-items: center;
+            color: #409EFF;
+            font-family: sans-serif;
+            font-size: 14px;
+            flex-direction: column;
+            z-index: 10;
+            /* 添加过渡效果，让显隐更柔和 */
+            transition: opacity 0.3s;
+        }
+
+        .loader {
+            border: 4px solid #E4E7ED;
+            /* 浅灰色底圈 */
+            border-top: 4px solid #409EFF;
+            /* Element Plus 蓝色主色调 */
+            border-radius: 50%;
+            width: 40px;
+            height: 40px;
+            animation: spin 1.2s linear infinite;
+            /* 应用动画 */
+            margin-bottom: 20px;
+        }
+
+        @keyframes spin {
+            0% {
+                transform: rotate(0deg);
+            }
+            100% {
+                transform: rotate(360deg);
+            }
+        }
+
+        #session-display {
+            margin: 10px 0;
+            padding: 5px;
+            background-color: #f8f9fa;
+            border-radius: 4px;
+            display: inline-block;
+        }
+
+        #session-value {
+            font-weight: bold;
+            color: #007bff;
+        }
+    </style>
+</head>
+<body>
+    <script>
+        (function () {
+            const params = new URLSearchParams(window.location.search);
+            if (params.get('mode') === 'embed') {
+                document.body.classList.add('embed-mode');
+            }
+        })();
+    </script>
+    <!-- 【核心修改】将所有控件包裹在一个 div 中，方便样式选择器工作 -->
+    <div id="webrtc-controls">
+        <button id="start" onclick="start()">Start</button>
+        <button id="stop" style="display: none" onclick="stop()">Stop</button>
+        <!-- Recording controls removed per request -->
+
+        <div class="option">
+            <input type="file" id="upload_audio" accept="audio/*" />
+            <button class="btn btn-primary" id="btn_upload_audio">Upload Audio</button>
+            <span id="upload_hint"></span>
+        </div>
+        <input type="hidden" id="sessionid" value="0">
+        <div id="session-display">Session ID: <span id="session-value">0</span></div>
+    </div>
+
+<div id="media">
+    <div id="loading-overlay">
+        <div class="loader"></div>
+        <span id="loading-text">正在连接视频流...</span>
+    </div>
+    <h2>Media</h2>
+
+    <audio id="audio" autoplay="true"></audio>
+    <video id="video" style="width:600px;" autoplay="true" playsinline="true"></video>
+</div>
+
+<script type="text/javascript" src="https://code.jquery.com/jquery-2.1.1.min.js"></script>
+<script src="client.js"></script>
+</body>
+<script type="text/javascript" charset="utf-8">
+
+	$(document).ready(function() {
+	  // var host = window.location.hostname
+	  // var ws = new WebSocket("ws://"+host+":8000/humanecho");
+	  // //document.getElementsByTagName("video")[0].setAttribute("src", aa["video"]);
+	  // ws.onopen = function() {
+		// console.log('Connected');
+	  // };
+	  // ws.onmessage = function(e) {
+		// console.log('Received: ' + e.data);
+		// data = e
+		// var vid = JSON.parse(data.data); 
+		// console.log(typeof(vid),vid)
+		// //document.getElementsByTagName("video")[0].setAttribute("src", vid["video"]);
+		
+	  // };
+	  // ws.onclose = function(e) {
+		// console.log('Closed');
+	  // };
+
+      // 顯示 session ID 的函數
+      function updateSessionDisplay(sessionId) {
+          console.log('updateSessionDisplay called with sessionId:', sessionId);
+          // 更新隱藏的輸入框
+          document.getElementById('sessionid').value = sessionId;
+          // 更新顯示元素
+          document.getElementById('session-value').textContent = sessionId;
+          console.log('Session display updated. Current value:', document.getElementById('session-value').textContent);
+      }
+
+      // 將 updateSessionDisplay 函數附加到 window 對象，使其可從外部訪問
+      window.updateSessionDisplay = updateSessionDisplay;
+      console.log('updateSessionDisplay function attached to window object');
+
+      // removed echo-form; no TTS trigger from text input
+
+      // Audio upload handlers
+      let selectedFile = null;
+      $('#upload_audio').on('change', function(e) {
+          selectedFile = e.target.files && e.target.files.length ? e.target.files[0] : null;
+          $('#upload_hint').text(selectedFile ? ('Selected: ' + selectedFile.name) : '');
+      });
+
+      $('#btn_upload_audio').on('click', function() {
+          const sid = parseInt(document.getElementById('sessionid').value);
+          if (!sid) {
+              alert('Please click Start to establish a session first.');
+              return;
+          }
+          if (!selectedFile) {
+              alert('Please choose an audio file first.');
+              return;
+          }
+          const fd = new FormData();
+          fd.append('sessionid', String(sid));
+          fd.append('file', selectedFile);
+          $('#btn_upload_audio').prop('disabled', true);
+          $('#upload_hint').text('Uploading...');
+          fetch('/humanaudio', {
+              method: 'POST',
+              body: fd,
+          }).then(function(resp) {
+              if (!resp.ok) throw new Error('Upload failed');
+              return resp.json();
+          }).then(function(data) {
+              console.log('Upload ok:', data);
+              $('#upload_hint').text('Uploaded. The avatar should respond shortly.');
+          }).catch(function(err) {
+              console.error('Upload error:', err);
+              $('#upload_hint').text('Upload failed');
+          }).finally(function(){
+              $('#btn_upload_audio').prop('disabled', false);
+          });
+      });
+
+	});
+
+  
+</script>
+</html>

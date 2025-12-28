@@ -141,9 +141,22 @@ class BaseReal:
         return stream
 
     def flush_talk(self):
+        # Preserve legacy behavior: clear TTS and ASR internal queues
         self.tts.flush_talk()
         self.asr.flush_talk()
 
+        # Additionally, if a streaming audio pusher is attached (e.g. Ditto's
+        # AudioPusher), clear its internal buffers so that new uploads start
+        # from a clean state and do not mix with previous audio.
+        try:
+            audio_pusher = getattr(self, "_audio_pusher", None)
+            if audio_pusher is not None and hasattr(audio_pusher, "flush"):
+                audio_pusher.flush()
+        except Exception:
+            # Interrupt failures should never crash the app; detailed logging is
+            # handled by higher-level callers if needed.
+            pass
+    
     def is_speaking(self)->bool:
         return self.speaking
     
