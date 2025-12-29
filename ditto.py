@@ -127,6 +127,13 @@ class AudioPusher(threading.Thread):
                 # partial audio: send remaining samples and pad with silence
                 remain = self._audio_buffer
                 pad_len = self.chunk - remain.shape[0]
+                try:
+                    logger.info(
+                        "[AudioPusher] partial chunk detected: remain_samples=%d, pad_samples=%d",
+                        int(remain.shape[0]), int(pad_len),
+                    )
+                except Exception:
+                    pass
                 pad = np.zeros((pad_len,), dtype=np.float32)
                 chunk = np.concatenate([remain, pad], 0)
                 self._audio_buffer = np.zeros((0,), dtype=np.float32)

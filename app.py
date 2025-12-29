@@ -229,20 +229,13 @@ async def human(request):
 
 async def humanaudio(request):
     try:
-        logger.info("[humanaudio] 收到请求: method=%s, content_type=%s", request.method, request.content_type)
-        logger.info("[humanaudio] 请求头部部分信息: %s", dict(list(request.headers.items())[:10]))
-
         form = await request.post()
-        logger.info("[humanaudio] 解析到的表单字段 keys: %s", list(form.keys()))
 
         raw_sessionid = form.get('sessionid', 0)
         try:
             sessionid = int(raw_sessionid)
         except (TypeError, ValueError):
-            logger.info("[humanaudio] sessionid 无法转换为 int, 原始值=%r", raw_sessionid)
             sessionid = 0
-
-        logger.info("[humanaudio] 解析到的 sessionid=%s, 是否在 nerfreals 中: %s", sessionid, sessionid in nerfreals)
 
         upload_path = None
         upload_dir = None
@@ -251,13 +244,11 @@ async def humanaudio(request):
             filename = getattr(fileobj, 'filename', None)
             file_stream = getattr(fileobj, 'file', None)
             reported_size = getattr(fileobj, 'size', None)
-            logger.info("[humanaudio] 收到文件字段, filename=%s, fileobj_type=%s, file_stream_type=%s, reported_size=%s",
-                        filename, type(fileobj), type(file_stream), reported_size)
 
-            # 将上传的音频文件落盘到 uploads/<sessionid>/ 目录
+            # 将上传的音频文件统一落盘到项目根目录下的 uploads 目录
             if file_stream is not None and sessionid in nerfreals:
                 try:
-                    upload_dir = os.path.join('uploads', str(sessionid))
+                    upload_dir = os.path.join('uploads')
                     os.makedirs(upload_dir, exist_ok=True)
                     safe_name = filename or 'upload.wav'
                     upload_path = os.path.join(upload_dir, safe_name)
@@ -267,26 +258,22 @@ async def humanaudio(request):
                             if not chunk:
                                 break
                             f.write(chunk)
-                    logger.info("[humanaudio] 音频已保存到: %s", upload_path)
                 except Exception:
                     logger.exception("[humanaudio] 保存上传音频到磁盘时异常")
 
         interrupt_value = form.get('interrupt')
-        logger.info("[humanaudio] 收到 interrupt 字段原始值=%r", interrupt_value)
 
         # Check if the value is the boolean True OR the string 'true' (case-insensitive)
         if interrupt_value is True or str(interrupt_value).lower() == 'true':
-            logger.info("[humanaudio] interrupt 标志为真, 尝试打断当前说话 (sessionid=%s)", sessionid)
             if sessionid in nerfreals:
                 try:
                     nerfreals[sessionid].flush_talk()
-                    logger.info("[humanaudio] 已调用 nerfreals[%s].flush_talk()", sessionid)
                 except Exception:
                     logger.exception("[humanaudio] 调用 flush_talk 时异常")
             else:
-                logger.info("[humanaudio] sessionid=%s 不在 nerfreals 中, 无法 flush_talk", sessionid)
+                pass
 
-            # 中断模式下，删除该会话目录下除本次最新音频外的其它文件
+            # 中断模式下，删除 uploads 目录下除本次最新音频外的其它文件
             if upload_dir and upload_path:
                 try:
                     for name in os.listdir(upload_dir):
@@ -303,11 +290,8 @@ async def humanaudio(request):
         if upload_path and sessionid in nerfreals:
             try:
                 nerfreals[sessionid].set_audio_path(upload_path)
-                logger.info("[humanaudio] 最终调用 nerfreals[%s].set_audio_path, path=%s", sessionid, upload_path)
             except Exception:
-                logger.exception("[humanaudio] 调用 set_audio_path 时异常")
-
-        logger.info("[humanaudio] 处理完成, 即将返回成功响应")
+                logger.exception('[humanaudio] 调用 set_audio_path 时异常')
 
         return web.Response(
             content_type="application/json",
